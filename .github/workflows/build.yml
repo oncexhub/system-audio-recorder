@@ -21,9 +21,28 @@ jobs:
         with:
           name: SystemAudioRecorder
           path: target/release/SystemAudioRecorder.exe
+      - name: Package zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/SystemAudioRecorder.exe dist/
+          @(
+            'System Audio Recorder (SAR)'
+            ''
+            'Double-click SystemAudioRecorder.exe to start. No installation needed.'
+            'Press Ctrl + Alt + R anywhere to start/stop recording your PC audio.'
+            ''
+            'If Windows shows "Windows protected your PC": click More info -> Run anyway.'
+            ''
+            'More info: https://github.com/${{ github.repository }}'
+          ) | Set-Content dist/README.txt -Encoding utf8
+          Compress-Archive -Path dist/* -DestinationPath SAR-windows.zip
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/SystemAudioRecorder.exe
+          files: |
+            target/release/SystemAudioRecorder.exe
+            SAR-windows.zip
           generate_release_notes: true
