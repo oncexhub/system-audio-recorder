@@ -24,7 +24,8 @@ One hotkey to start, the same hotkey to stop. Tiny, native and free.
 
 - 🎧 **System audio only.** Records exactly what you hear (browser, Spotify, games, Discord), never the microphone.
 - ⌨️ **One global hotkey.** `Ctrl + Alt + R` starts and stops from anywhere, even in a game. You can change it.
-- ✂️ **Built-in trimming.** Cut off a late start or an early stop in seconds, with no quality loss.
+- ✂️ **Built-in trimming.** Cut off a late start or an early stop, with no quality loss. Zoom in to cut to a hundredth of a second.
+- ↔️ **Resizable.** Make the window as big as you like. The waveforms grow with it, and the app remembers the size.
 - 🎚️ **WAV, MP3 or M4A.** Choose 96–320 kbps for MP3 and M4A. The default is 192 kbps.
 - ⏱️ **Long recordings.** No length limit, and files stay playable even after a crash.
 - 🪶 **Tiny and light.** About 0.5 MB, no installer, about 1% CPU. Runs quietly in the tray.
@@ -70,11 +71,19 @@ The app records whatever device Windows is playing through: speakers, headphones
 Started a little too early or stopped too late? Cut it off:
 
 1. Click **Trim** after a recording, or click **TRIM** at the top and pick a file. You can also drag a `.wav`, `.mp3` or `.m4a` onto the window.
-2. Drag the two handles. Fine-tune with **− / +** or the arrow keys (0.1 s, or 1 s with Shift).
+2. Drag the two handles. Fine-tune with **− / +** or the arrow keys: 0.1 s, 1 s with Shift, or 0.01 s with Ctrl.
+   - **Scroll** over the waveform to zoom in where your mouse is, and **Shift + scroll** to move sideways.
+   - The strip under the waveform shows the whole file. Drag the white frame to jump around, and press `0` to zoom out fully.
+   - Make the window bigger, or maximize it, for an even more detailed waveform.
 3. Press **▶** to check the start or the end, and Space to play the selection.
 4. Click **Save as copy** to keep the original, or **Replace original** to overwrite it (the app asks first).
 
 Cutting never re-encodes, so quality stays identical and even hours-long recordings save in seconds.
+
+<div align="center">
+<img src="docs/zoom.png" width="720" alt="Zoomed-in trim editor in a large window"><br>
+<sub><b>Zoomed in on a large window: the frame in the strip shows which part you're looking at</b></sub>
+</div>
 
 ## Formats
 

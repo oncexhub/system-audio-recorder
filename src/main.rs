@@ -77,6 +77,8 @@ struct App {
     pressed: Option<Hit>,
     editor: Option<Editor>,
     dragging: Option<Handle>,
+    /// Dragging the visible window in the overview strip.
+    dragging_overview: bool,
     shortcut_prompt: bool,
     icon_idle: HICON,
     icon_rec: HICON,
@@ -136,7 +138,7 @@ fn main() {
             settings: Settings::load(),
             startup: startup_enabled(),
             recorder: None,
-            waves: VecDeque::with_capacity(ui::WAVE_BARS),
+            waves: VecDeque::with_capacity(ui::MAX_WAVE_BARS),
             capturing_hotkey: false,
             hotkey_ok: false,
             shown_secs: u64::MAX,
@@ -147,6 +149,7 @@ fn main() {
             pressed: None,
             editor: None,
             dragging: None,
+            dragging_overview: false,
             shortcut_prompt: false,
             // Idle tray icon = the app logo; recording = red dot.
             icon_idle: LoadImageW(Some(hinst.into()), PCWSTR(1 as _), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR)
@@ -156,7 +159,8 @@ fn main() {
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
         }));
 
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        // Resizable: the layout grows with the window (see ui.rs).
+        let style = WS_OVERLAPPEDWINDOW;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS_NAME,
@@ -174,7 +178,7 @@ fn main() {
         .unwrap();
 
         if !std::env::args().any(|a| a == "--tray") {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, if app().settings.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW });
         }
         if let Some(p) = open_file {
             open_editor(p);
@@ -198,12 +202,37 @@ fn scale() -> f32 {
     dpi() as f32 / 96.0
 }
 
-unsafe fn size_window(hwnd: HWND, dpi: u32) {
+/// Outer window size (pixels) for a client area of `w` x `h` (96-DPI units).
+unsafe fn outer_size(hwnd: HWND, w: f32, h: f32, dpi: u32) -> (i32, i32) {
     let s = dpi as f32 / 96.0;
-    let mut r = RECT { left: 0, top: 0, right: (ui::WIDTH * s).round() as i32, bottom: (ui::HEIGHT * s).round() as i32 };
+    let mut r = RECT { left: 0, top: 0, right: (w * s).round() as i32, bottom: (h * s).round() as i32 };
     let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
     let _ = AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE::default(), dpi);
-    let _ = SetWindowPos(hwnd, None, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    (r.right - r.left, r.bottom - r.top)
+}
+
+/// Initial size: the remembered one, or the default (= minimum) size.
+unsafe fn size_window(hwnd: HWND, dpi: u32) {
+    let st = &app().settings;
+    let w = if st.window_w > 0 { st.window_w as f32 } else { ui::MIN_W };
+    let h = if st.window_h > 0 { st.window_h as f32 } else { ui::MIN_H };
+    let (ow, oh) = outer_size(hwnd, w.max(ui::MIN_W), h.max(ui::MIN_H), dpi);
+    let _ = SetWindowPos(hwnd, None, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+/// Remembers the current (restored) client size and maximized state.
+unsafe fn remember_size() {
+    let a = app();
+    let max = IsZoomed(a.hwnd).as_bool();
+    if !max && !IsIconic(a.hwnd).as_bool() {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(a.hwnd, &mut rc);
+        let s = scale();
+        a.settings.window_w = (rc.right as f32 / s).round() as u32;
+        a.settings.window_h = (rc.bottom as f32 / s).round() as u32;
+    }
+    a.settings.maximized = max;
+    a.settings.save();
 }
 
 /// Dark title bar and border so the window matches the UI (Windows 11).
@@ -242,13 +271,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DPICHANGED => {
             let r = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-            size_window(hwnd, (wp.0 & 0xffff) as u32);
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            // Never smaller than the layout's minimum size.
+            let mm = &mut *(lp.0 as *mut MINMAXINFO);
+            let d = GetDpiForWindow(hwnd).max(96);
+            let (w, h) = outer_size(hwnd, ui::MIN_W, ui::MIN_H, d);
+            mm.ptMinTrackSize = POINT { x: w, y: h };
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Some(g) = app().gfx.as_mut() {
-                g.resize((lp.0 & 0xffff) as u32, ((lp.0 >> 16) & 0xffff) as u32, dpi() as f32);
+            let (w, h) = ((lp.0 & 0xffff) as u32, ((lp.0 >> 16) & 0xffff) as u32);
+            if w > 0 && h > 0 {
+                let s = scale();
+                ui::set_size(w as f32 / s, h as f32 / s);
             }
+            if let Some(g) = app().gfx.as_mut() {
+                g.resize(w, h, dpi() as f32);
+            }
+            if wp.0 as u32 == SIZE_MAXIMIZED || wp.0 as u32 == SIZE_RESTORED {
+                if wp.0 as u32 == SIZE_MAXIMIZED || app().settings.maximized {
+                    remember_size();
+                }
+            }
+            redraw();
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            remember_size();
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL if app().editor.is_some() => {
+            on_wheel(msg == WM_MOUSEHWHEEL, ((wp.0 >> 16) & 0xffff) as i16, wp.0 & 0x4 != 0, lp);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -261,9 +316,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let a = app();
+            if let (true, Some(ed)) = (a.dragging_overview, a.editor.as_mut()) {
+                let (x, _) = dip(lp);
+                ed.center_on(ui::overview_time(x, ed.duration()));
+                redraw();
+                return LRESULT(0);
+            }
             if let (Some(h), Some(ed)) = (a.dragging, a.editor.as_mut()) {
                 let (x, _) = dip(lp);
-                ed.set_handle(h, ui::wave_time(x, ed.duration()));
+                let (va, vb) = ed.view();
+                ed.set_handle(h, ui::wave_time(x, va, vb));
                 ed.playhead = if h == Handle::Start { ed.start } else { ed.end };
                 redraw();
                 return LRESULT(0);
@@ -302,11 +364,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if a.pressed == Some(Hit::Wave) {
                 wave_press(lp);
             }
+            if a.pressed == Some(Hit::Overview) {
+                if let Some(ed) = a.editor.as_mut() {
+                    if ed.is_zoomed() {
+                        let (x, _) = dip(lp);
+                        ed.center_on(ui::overview_time(x, ed.duration()));
+                        a.dragging_overview = true;
+                        SetCapture(a.hwnd);
+                    } else {
+                        // Not zoomed: clicking the strip moves the playhead.
+                        let (x, _) = dip(lp);
+                        ed.stop();
+                        ed.playhead = ui::overview_time(x, ed.duration());
+                    }
+                    redraw();
+                }
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let a = app();
-            if a.dragging.take().is_some() {
+            if a.dragging.take().is_some() || std::mem::take(&mut a.dragging_overview) {
                 let _ = ReleaseCapture();
                 a.pressed = None;
                 redraw();
@@ -421,9 +499,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 fn view_data(a: &App) -> (String, String, Vec<f32>) {
     let hk = hotkey_text(a.settings.hotkey);
     let folder = a.settings.folder.display().to_string();
-    // Newest level on the right; pad on the left with silence.
-    let mut waves = vec![0.0; ui::WAVE_BARS - a.waves.len().min(ui::WAVE_BARS)];
-    waves.extend(a.waves.iter().copied());
+    // Newest level last; the UI shows as many as fit.
+    let waves = a.waves.iter().copied().collect();
     (hk, folder, waves)
 }
 
@@ -456,21 +533,29 @@ fn make_view<'a>(a: &App, hk: &'a str, folder: &'a str, waves: &'a [f32], footer
 struct EditorData {
     name: String,
     columns: Vec<f32>,
+    overview: Vec<f32>,
 }
 
 fn editor_data(a: &App) -> Option<EditorData> {
     let ed = a.editor.as_ref()?;
+    let (va, vb) = ed.view();
+    let n = ui::edit_cols();
     Some(EditorData {
         name: ed.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        columns: ed.columns(ui::EDIT_COLS),
+        columns: ed.columns(n, va, vb),
+        overview: ed.columns(n, 0.0, ed.duration()),
     })
 }
 
 fn editor_view<'a>(a: &App, d: &'a Option<EditorData>) -> Option<EditorView<'a>> {
     let (ed, d) = (a.editor.as_ref()?, d.as_ref()?);
+    let (view_start, view_end) = ed.view();
     Some(EditorView {
         name: &d.name,
         columns: &d.columns,
+        overview: &d.overview,
+        view_start,
+        view_end,
         duration: ed.duration(),
         start: ed.start,
         end: ed.end,
@@ -507,9 +592,13 @@ fn hit_at(lp: LPARAM) -> Option<Hit> {
     let a = app();
     let (x, y) = dip(lp);
     if let Some(ed) = &a.editor {
+        let (view_start, view_end) = ed.view();
         let ev = EditorView {
             name: "",
             columns: &[],
+            overview: &[],
+            view_start,
+            view_end,
             duration: ed.duration(),
             start: ed.start,
             end: ed.end,
@@ -589,11 +678,10 @@ unsafe fn on_click(h: Hit) {
             }
         }
         Hit::Back => close_editor(),
-        Hit::Wave => {}
+        Hit::Wave | Hit::Overview => {}
         Hit::StartMinus | Hit::StartPlus | Hit::EndMinus | Hit::EndPlus => {
             if let Some(ed) = a.editor.as_mut() {
-                let big = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                let step = if big { 1.0 } else { 0.1 };
+                let step = nudge_step();
                 let (h, d) = match h {
                     Hit::StartMinus => (Handle::Start, -step),
                     Hit::StartPlus => (Handle::Start, step),
@@ -673,6 +761,7 @@ unsafe fn editor_tick() {
     let a = app();
     if let Some(ed) = a.editor.as_mut() {
         ed.update();
+        ed.follow_playhead();
         if let Some(e) = ed.load_error() {
             set_footer(&e, FooterKind::Error);
         }
@@ -696,9 +785,9 @@ unsafe fn wave_press(lp: LPARAM) {
     let a = app();
     let Some(ed) = a.editor.as_mut() else { return };
     let (x, _) = dip(lp);
-    let dur = ed.duration();
-    let ds = (x - ui::wave_x(ed.start, dur)).abs();
-    let de = (x - ui::wave_x(ed.end, dur)).abs();
+    let (va, vb) = ed.view();
+    let ds = (x - ui::wave_x(ed.start, va, vb)).abs();
+    let de = (x - ui::wave_x(ed.end, va, vb)).abs();
     let grab = if ds <= 10.0 && ds <= de {
         Some(Handle::Start)
     } else if de <= 10.0 {
@@ -712,7 +801,7 @@ unsafe fn wave_press(lp: LPARAM) {
         a.dragging = Some(h);
         SetCapture(a.hwnd);
     } else {
-        let t = ui::wave_time(x, dur);
+        let t = ui::wave_time(x, va, vb);
         let was_playing = ed.is_playing();
         ed.stop();
         ed.playhead = t;
@@ -723,11 +812,51 @@ unsafe fn wave_press(lp: LPARAM) {
     redraw();
 }
 
+/// Arrow/button step: 0.1 s, Shift = 1 s, Ctrl = 0.01 s.
+unsafe fn nudge_step() -> f64 {
+    if GetKeyState(VK_CONTROL.0 as i32) < 0 {
+        0.01
+    } else if GetKeyState(VK_SHIFT.0 as i32) < 0 {
+        1.0
+    } else {
+        0.1
+    }
+}
+
+/// Mouse wheel in the editor: zoom around the cursor; Shift/tilt = move sideways.
+unsafe fn on_wheel(horizontal: bool, delta: i16, shift: bool, lp: LPARAM) {
+    let a = app();
+    let Some(ed) = a.editor.as_mut() else { return };
+    let mut pt = POINT { x: (lp.0 & 0xffff) as i16 as i32, y: ((lp.0 >> 16) & 0xffff) as i16 as i32 };
+    let _ = ScreenToClient(a.hwnd, &mut pt);
+    let s = scale();
+    let x = pt.x as f32 / s;
+    let notches = delta as f64 / 120.0;
+    let (va, vb) = ed.view();
+    if horizontal || shift {
+        let dir = if horizontal { notches } else { -notches };
+        ed.pan(dir * (vb - va) * 0.15);
+    } else {
+        ed.zoom(1.25f64.powf(notches), ui::wave_time(x, va, vb));
+    }
+    redraw();
+}
+
 unsafe fn editor_key(vk: u32) {
     let a = app();
     let Some(ed) = a.editor.as_mut() else { return };
-    let step = if GetKeyState(VK_SHIFT.0 as i32) < 0 { 1.0 } else { 0.1 };
+    let step = nudge_step();
     match VIRTUAL_KEY(vk as u16) {
+        VK_OEM_PLUS | VK_ADD => {
+            let (va, vb) = ed.view();
+            let at = if ed.playhead >= va && ed.playhead <= vb { ed.playhead } else { (va + vb) / 2.0 };
+            ed.zoom(1.5, at);
+        }
+        VK_OEM_MINUS | VK_SUBTRACT => {
+            let (va, vb) = ed.view();
+            ed.zoom(1.0 / 1.5, (va + vb) / 2.0);
+        }
+        VK_0 | VK_NUMPAD0 => ed.fit(),
         VK_SPACE => {
             let _ = ed.toggle_play();
         }
@@ -1026,7 +1155,7 @@ unsafe fn tick() {
     let a = app();
     let Some(r) = &a.recorder else { return };
     for l in r.take_levels() {
-        if a.waves.len() == ui::WAVE_BARS {
+        if a.waves.len() == ui::MAX_WAVE_BARS {
             a.waves.pop_front();
         }
         a.waves.push_back(l);
@@ -1071,6 +1200,7 @@ unsafe fn show_window() {
 }
 
 unsafe fn hide_window() {
+    remember_size();
     let a = app();
     if a.capturing_hotkey {
         cancel_hotkey_capture();
@@ -1085,6 +1215,7 @@ unsafe fn hide_window() {
 }
 
 unsafe fn exit_app() {
+    remember_size();
     let a = app();
     a.editor = None;
     if let Some(r) = a.recorder.take() {

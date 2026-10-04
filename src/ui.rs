@@ -1,6 +1,9 @@
 //! Custom dark UI drawn with Direct2D/DirectWrite (built into Windows).
 //! Everything is laid out in 96-DPI units; Direct2D scales it for the
-//! monitor, so it stays crisp at any display scaling.
+//! monitor, so it stays crisp at any display scaling. The layout follows the
+//! window size: cards get wider, and waveforms get the extra height.
+
+use std::cell::Cell;
 
 use windows::core::w;
 use windows::Win32::Foundation::HWND;
@@ -10,14 +13,38 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_numerics::Vector2;
 
-pub const WIDTH: f32 = 460.0;
-pub const HEIGHT: f32 = 678.0;
+/// Smallest (and default) client size.
+pub const MIN_W: f32 = 460.0;
+pub const MIN_H: f32 = 678.0;
 
-pub const WAVE_BARS: usize = 62;
+/// Longest waveform history the main screen can show (bars).
+pub const MAX_WAVE_BARS: usize = 400;
 
 const PAD: f32 = 24.0;
 const INNER: f32 = 44.0; // content inset inside cards
-const RIGHT: f32 = WIDTH - INNER;
+
+thread_local! {
+    static SIZE: Cell<(f32, f32)> = const { Cell::new((MIN_W, MIN_H)) };
+}
+
+/// Sets the current client size (in 96-DPI units).
+pub fn set_size(w: f32, h: f32) {
+    SIZE.with(|s| s.set((w.max(MIN_W), h.max(MIN_H))));
+}
+
+fn ww() -> f32 {
+    SIZE.with(|s| s.get().0)
+}
+fn hh() -> f32 {
+    SIZE.with(|s| s.get().1)
+}
+fn right() -> f32 {
+    ww() - INNER
+}
+/// Extra height beyond the minimum, given to the waveforms.
+fn extra() -> f32 {
+    hh() - MIN_H
+}
 
 // Palette
 const BG: u32 = 0x0B0B0D;
@@ -59,6 +86,7 @@ pub enum Hit {
     // Editor
     Back,
     Wave,
+    Overview,
     StartMinus,
     StartPlus,
     EndMinus,
@@ -96,6 +124,7 @@ pub struct View<'a> {
     pub footer: &'a str,
     pub footer_kind: FooterKind,
     pub hover: Option<Hit>,
+    /// Level history, newest last.
     pub waves: &'a [f32],
     pub can_trim: bool,
     pub editor: Option<EditorView<'a>>,
@@ -104,8 +133,13 @@ pub struct View<'a> {
 
 pub struct EditorView<'a> {
     pub name: &'a str,
+    /// Peaks for the visible range (`view_start..view_end`).
     pub columns: &'a [f32],
+    /// Peaks for the whole file (overview strip).
+    pub overview: &'a [f32],
     pub duration: f64,
+    pub view_start: f64,
+    pub view_end: f64,
     pub start: f64,
     pub end: f64,
     pub playhead: f64,
@@ -134,27 +168,48 @@ impl Rect {
     }
 }
 
-// ---- Layout -------------------------------------------------------------
+// ---- Main screen layout -------------------------------------------------
 
-const REC_CARD: Rect = rc(PAD, 66.0, WIDTH - PAD, 296.0);
-const WAVE_CY: f32 = 118.0;
-const WAVE_HALF: f32 = 30.0;
-const TIMER: Rect = rc(INNER, 156.0, RIGHT, 200.0);
-const TIMER_SUB: Rect = rc(INNER, 200.0, RIGHT, 220.0);
-const RECORD_BTN: Rect = rc(INNER, 236.0, RIGHT, 276.0);
+fn rec_card() -> Rect {
+    rc(PAD, 66.0, ww() - PAD, 296.0 + extra())
+}
+fn wave_cy() -> f32 {
+    118.0 + extra() / 2.0
+}
+fn wave_half() -> f32 {
+    30.0 + extra() / 2.0 * 0.85
+}
+fn timer() -> Rect {
+    rc(INNER, 156.0 + extra(), right(), 200.0 + extra())
+}
+fn timer_sub() -> Rect {
+    rc(INNER, 200.0 + extra(), right(), 220.0 + extra())
+}
+fn record_btn() -> Rect {
+    rc(INNER, 236.0 + extra(), right(), 276.0 + extra())
+}
 
-const SETTINGS_LABEL_Y: f32 = 314.0;
-const SET_CARD_TOP: f32 = 334.0;
 const ROW_H: f32 = 50.0;
 const ROWS: usize = 6;
 
 /// Bitrates offered for MP3 and M4A (kbps).
 pub const BITRATES: [u32; 5] = [96, 128, 192, 256, 320];
-const SET_CARD: Rect = rc(PAD, SET_CARD_TOP, WIDTH - PAD, SET_CARD_TOP + ROW_H * ROWS as f32);
-const FOOTER: Rect = rc(PAD, SET_CARD_TOP + ROW_H * ROWS as f32 + 8.0, WIDTH - PAD, HEIGHT - 6.0);
+
+fn settings_label_y() -> f32 {
+    314.0 + extra()
+}
+fn set_card_top() -> f32 {
+    334.0 + extra()
+}
+fn set_card() -> Rect {
+    rc(PAD, set_card_top(), ww() - PAD, set_card_top() + ROW_H * ROWS as f32)
+}
+fn footer_rect() -> Rect {
+    rc(PAD, set_card_top() + ROW_H * ROWS as f32 + 8.0, ww() - PAD, hh() - 6.0)
+}
 
 fn row_top(i: usize) -> f32 {
-    SET_CARD_TOP + ROW_H * i as f32
+    set_card_top() + ROW_H * i as f32
 }
 
 fn control_rect(i: usize, l: f32, r: f32) -> Rect {
@@ -163,19 +218,19 @@ fn control_rect(i: usize, l: f32, r: f32) -> Rect {
 }
 
 fn hotkey_chip() -> Rect {
-    control_rect(0, RIGHT - 150.0, RIGHT)
+    control_rect(0, right() - 150.0, right())
 }
 fn folder_change() -> Rect {
-    control_rect(1, RIGHT - 150.0, RIGHT - 70.0)
+    control_rect(1, right() - 150.0, right() - 70.0)
 }
 fn folder_open() -> Rect {
-    control_rect(1, RIGHT - 64.0, RIGHT)
+    control_rect(1, right() - 64.0, right())
 }
 fn format_seg() -> Rect {
-    control_rect(2, RIGHT - 156.0, RIGHT)
+    control_rect(2, right() - 156.0, right())
 }
 fn quality_seg() -> Rect {
-    control_rect(3, RIGHT - 200.0, RIGHT)
+    control_rect(3, right() - 200.0, right())
 }
 
 /// Splits a segmented control into `n` equal parts.
@@ -185,22 +240,27 @@ fn segments(r: &Rect, n: usize) -> Vec<Rect> {
 }
 fn toggle(i: usize) -> Rect {
     let t = row_top(i) + 15.0;
-    rc(RIGHT - 36.0, t, RIGHT, t + 20.0)
+    rc(right() - 36.0, t, right(), t + 20.0)
+}
+
+/// Number of bars the main-screen waveform shows at the current width.
+fn wave_bars() -> usize {
+    (((right() - INNER) + 3.0) / 6.0) as usize
 }
 
 /// Finds which interactive element is under a point (in 96-DPI units).
 pub fn hit_test(x: f32, y: f32, v: &View) -> Option<Hit> {
     let fmt = segments(&format_seg(), 3);
     let mut candidates = vec![
-        (RECORD_BTN, Hit::Record),
+        (record_btn(), Hit::Record),
         (hotkey_chip(), Hit::Hotkey),
         (folder_change(), Hit::FolderChange),
         (folder_open(), Hit::FolderOpen),
         (rc(fmt[0].l, fmt[0].t, fmt[0].r, fmt[0].b), Hit::FormatWav),
         (rc(fmt[1].l, fmt[1].t, fmt[1].r, fmt[1].b), Hit::FormatMp3),
         (rc(fmt[2].l, fmt[2].t, fmt[2].r, fmt[2].b), Hit::FormatM4a),
-        (rc(INNER, row_top(4), RIGHT, row_top(5)), Hit::Tray),
-        (rc(INNER, row_top(5), RIGHT, row_top(6)), Hit::Startup),
+        (rc(INNER, row_top(4), right(), row_top(5)), Hit::Tray),
+        (rc(INNER, row_top(5), right(), row_top(6)), Hit::Startup),
     ];
     if v.format != 0 {
         for (i, r) in segments(&quality_seg(), BITRATES.len()).into_iter().enumerate() {
@@ -220,7 +280,7 @@ pub fn hit_test(x: f32, y: f32, v: &View) -> Option<Hit> {
         if v.can_trim && footer_trim_chip().contains(x, y) {
             return Some(Hit::FooterTrim);
         }
-        if FOOTER.contains(x, y) {
+        if footer_rect().contains(x, y) {
             return Some(Hit::Footer);
         }
     }
@@ -231,7 +291,7 @@ pub fn hit_test(x: f32, y: f32, v: &View) -> Option<Hit> {
 
 fn pill_rect(recording: bool) -> Rect {
     let w = if recording { 112.0 } else { 82.0 };
-    rc(WIDTH - PAD - w, 22.0, WIDTH - PAD, 48.0)
+    rc(ww() - PAD - w, 22.0, ww() - PAD, 48.0)
 }
 
 fn open_editor_chip(recording: bool) -> Rect {
@@ -240,20 +300,30 @@ fn open_editor_chip(recording: bool) -> Rect {
 }
 
 fn footer_trim_chip() -> Rect {
-    let cy = (FOOTER.t + FOOTER.b) / 2.0;
-    rc(WIDTH - PAD - 56.0, cy - 13.0, WIDTH - PAD, cy + 13.0)
+    let f = footer_rect();
+    let cy = f.t + 13.0;
+    rc(ww() - PAD - 56.0, cy - 13.0, ww() - PAD, cy + 13.0)
 }
 
 // ---- First-run shortcut prompt ----
 
-const PROMPT: Rect = rc(PAD + 16.0, 190.0, WIDTH - PAD - 16.0, 400.0);
-const PROMPT_NO: Rect = rc(PAD + 40.0, 340.0, WIDTH / 2.0 - 5.0, 380.0);
-const PROMPT_YES: Rect = rc(WIDTH / 2.0 + 5.0, 340.0, WIDTH - PAD - 40.0, 380.0);
+fn prompt() -> Rect {
+    let (cx, top) = (ww() / 2.0, (hh() - 210.0) / 2.0 - 40.0);
+    rc(cx - 190.0, top, cx + 190.0, top + 210.0)
+}
+fn prompt_no() -> Rect {
+    let p = prompt();
+    rc(p.l + 24.0, p.b - 60.0, ww() / 2.0 - 5.0, p.b - 20.0)
+}
+fn prompt_yes() -> Rect {
+    let p = prompt();
+    rc(ww() / 2.0 + 5.0, p.b - 60.0, p.r - 24.0, p.b - 20.0)
+}
 
 pub fn hit_test_prompt(x: f32, y: f32) -> Option<Hit> {
-    if PROMPT_YES.contains(x, y) {
+    if prompt_yes().contains(x, y) {
         Some(Hit::ShortcutYes)
-    } else if PROMPT_NO.contains(x, y) {
+    } else if prompt_no().contains(x, y) {
         Some(Hit::ShortcutNo)
     } else {
         None
@@ -261,86 +331,133 @@ pub fn hit_test_prompt(x: f32, y: f32) -> Option<Hit> {
 }
 
 // ---- Editor layout ----
+// Bottom controls are anchored to the bottom of the window; the waveform
+// card takes all remaining height.
 
-pub const EDIT_COLS: usize = 186;
-pub const WAVE_L: f32 = INNER;
-pub const WAVE_R: f32 = RIGHT;
-const E_WAVE_CARD: Rect = rc(PAD, 66.0, WIDTH - PAD, 300.0);
-const E_WAVE: Rect = rc(INNER, 84.0, RIGHT, 236.0);
-const E_TRIM_TOP: f32 = 316.0;
-const E_TRIM_CARD: Rect = rc(PAD, E_TRIM_TOP, WIDTH - PAD, E_TRIM_TOP + 100.0);
-const E_PLAY: Rect = rc(PAD, 432.0, WIDTH - PAD, 472.0);
-const E_SAVE: Rect = rc(PAD, 484.0, WIDTH / 2.0 - 4.0, 526.0);
-const E_REPLACE: Rect = rc(WIDTH / 2.0 + 4.0, 484.0, WIDTH - PAD, 526.0);
-const E_FOOTER: Rect = rc(PAD, 540.0, WIDTH - PAD, 566.0);
 const BACK: Rect = rc(PAD, 20.0, PAD + 30.0, 50.0);
 
+fn bottom() -> f32 {
+    hh() - 14.0
+}
+fn e_footer() -> Rect {
+    rc(PAD, bottom() - 26.0, ww() - PAD, bottom())
+}
+fn e_save() -> Rect {
+    rc(PAD, bottom() - 78.0, ww() / 2.0 - 4.0, bottom() - 36.0)
+}
+fn e_replace() -> Rect {
+    rc(ww() / 2.0 + 4.0, bottom() - 78.0, ww() - PAD, bottom() - 36.0)
+}
+fn e_play_btn() -> Rect {
+    rc(PAD, bottom() - 130.0, ww() - PAD, bottom() - 90.0)
+}
+fn e_trim_top() -> f32 {
+    bottom() - 246.0
+}
+fn e_trim_card() -> Rect {
+    rc(PAD, e_trim_top(), ww() - PAD, e_trim_top() + 100.0)
+}
+fn e_wave_card() -> Rect {
+    rc(PAD, 66.0, ww() - PAD, e_trim_top() - 16.0)
+}
+/// The zoomable waveform.
+fn e_wave() -> Rect {
+    rc(INNER, 84.0, right(), e_wave_card().b - 100.0)
+}
+/// Whole-file overview strip with the visible range highlighted.
+fn e_overview() -> Rect {
+    let b = e_wave_card().b;
+    rc(INNER, b - 86.0, right(), b - 64.0)
+}
+fn e_labels() -> Rect {
+    let b = e_wave_card().b;
+    rc(INNER, b - 58.0, right(), b - 40.0)
+}
+fn e_hint() -> Rect {
+    let b = e_wave_card().b;
+    rc(INNER, b - 34.0, right(), b - 16.0)
+}
+
 fn e_row(i: usize) -> f32 {
-    E_TRIM_TOP + ROW_H * i as f32
+    e_trim_top() + ROW_H * i as f32
 }
 fn e_ctrl(i: usize, l: f32, r: f32) -> Rect {
     let t = e_row(i) + 11.0;
     rc(l, t, r, t + 28.0)
 }
 fn e_play(i: usize) -> Rect {
-    e_ctrl(i, RIGHT - 36.0, RIGHT)
+    e_ctrl(i, right() - 36.0, right())
 }
 fn e_plus(i: usize) -> Rect {
-    e_ctrl(i, RIGHT - 74.0, RIGHT - 44.0)
+    e_ctrl(i, right() - 74.0, right() - 44.0)
 }
 fn e_minus(i: usize) -> Rect {
-    e_ctrl(i, RIGHT - 108.0, RIGHT - 78.0)
+    e_ctrl(i, right() - 108.0, right() - 78.0)
 }
 fn e_time(i: usize) -> Rect {
-    e_ctrl(i, RIGHT - 220.0, RIGHT - 116.0)
+    e_ctrl(i, right() - 230.0, right() - 116.0)
 }
 
-pub fn wave_x(t: f64, dur: f64) -> f32 {
-    if dur <= 0.0 {
-        return WAVE_L;
+/// Number of waveform columns at the current width (one per 2 units).
+pub fn edit_cols() -> usize {
+    ((right() - INNER) / 2.0) as usize
+}
+
+/// Time -> x inside the zoomable waveform.
+pub fn wave_x(t: f64, a: f64, b: f64) -> f32 {
+    if b <= a {
+        return INNER;
     }
-    WAVE_L + ((t / dur).clamp(0.0, 1.0) as f32) * (WAVE_R - WAVE_L)
+    INNER + (((t - a) / (b - a)) as f32) * (right() - INNER)
 }
 
-pub fn wave_time(x: f32, dur: f64) -> f64 {
-    (((x - WAVE_L) / (WAVE_R - WAVE_L)).clamp(0.0, 1.0) as f64) * dur
+/// x inside the zoomable waveform -> time.
+pub fn wave_time(x: f32, a: f64, b: f64) -> f64 {
+    a + (((x - INNER) / (right() - INNER)).clamp(0.0, 1.0) as f64) * (b - a)
+}
+
+/// x inside the overview strip -> time.
+pub fn overview_time(x: f32, dur: f64) -> f64 {
+    wave_time(x, 0.0, dur)
 }
 
 pub fn hit_test_editor(x: f32, y: f32, e: &EditorView) -> Option<Hit> {
-    let wave_zone = rc(E_WAVE.l - 8.0, E_WAVE.t - 6.0, E_WAVE.r + 8.0, E_WAVE.b + 6.0);
+    let w = e_wave();
+    let o = e_overview();
     let mut candidates = vec![
         (BACK, Hit::Back),
-        (wave_zone, Hit::Wave),
+        (rc(w.l - 8.0, w.t - 6.0, w.r + 8.0, w.b + 6.0), Hit::Wave),
+        (rc(o.l, o.t - 4.0, o.r, o.b + 4.0), Hit::Overview),
         (e_minus(0), Hit::StartMinus),
         (e_plus(0), Hit::StartPlus),
         (e_play(0), Hit::PlayStart),
         (e_minus(1), Hit::EndMinus),
         (e_plus(1), Hit::EndPlus),
         (e_play(1), Hit::PlayEnd),
-        (E_PLAY, Hit::PlayPause),
+        (e_play_btn(), Hit::PlayPause),
     ];
     if e.loading.is_none() {
-        candidates.push((E_SAVE, Hit::SaveCopy));
-        candidates.push((E_REPLACE, Hit::Replace));
+        candidates.push((e_save(), Hit::SaveCopy));
+        candidates.push((e_replace(), Hit::Replace));
     }
     candidates.into_iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| h)
 }
 
-/// "mm:ss.t" (or "h:mm:ss.t" for long files).
+/// "mm:ss.cc" (or "h:mm:ss.cc" for long files).
 pub fn fmt_precise(t: f64) -> String {
     let t = t.max(0.0);
-    let tenths = (t * 10.0).round() as u64;
-    let (s, d) = (tenths / 10, tenths % 10);
+    let cs = (t * 100.0).round() as u64;
+    let (s, c) = (cs / 100, cs % 100);
     if s >= 3600 {
-        format!("{}:{:02}:{:02}.{}", s / 3600, s / 60 % 60, s % 60, d)
+        format!("{}:{:02}:{:02}.{:02}", s / 3600, s / 60 % 60, s % 60, c)
     } else {
-        format!("{:02}:{:02}.{}", s / 60, s % 60, d)
+        format!("{:02}:{:02}.{:02}", s / 60, s % 60, c)
     }
 }
 
 fn fmt_secs(t: f64) -> String {
     if t < 60.0 {
-        format!("{:.1} s", t)
+        format!("{:.2} s", t)
     } else {
         fmt_precise(t)
     }
@@ -446,7 +563,7 @@ impl Gfx {
                 D2D1_GRADIENT_STOP { position: 1.0, color: color(WAVE_B, 1.0) },
             ];
             let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
-            let lp = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: v2(INNER, 0.0), endPoint: v2(RIGHT, 0.0) };
+            let lp = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: v2(INNER, 0.0), endPoint: v2(right(), 0.0) };
             let wave = rt.CreateLinearGradientBrush(&lp, None, &coll)?;
             self.target = Some(Target { rt, brush, wave });
         }
@@ -470,6 +587,9 @@ impl Gfx {
         }
         let ok = unsafe {
             let t = self.target.as_ref().unwrap();
+            // The gradient spans the content width, which follows the window.
+            t.wave.SetStartPoint(v2(INNER, 0.0));
+            t.wave.SetEndPoint(v2(right(), 0.0));
             t.rt.BeginDraw();
             t.rt.Clear(Some(&color(BG, 1.0)));
             self.paint(t, v);
@@ -561,14 +681,15 @@ impl Gfx {
     unsafe fn shortcut_prompt(&self, t: &Target, v: &View) {
         // Dim everything behind the card.
         t.brush.SetColor(&color(BG, 0.78));
-        t.rt.FillRectangle(&rc(0.0, 0.0, WIDTH, HEIGHT + 200.0).d2d(), &t.brush);
+        t.rt.FillRectangle(&rc(0.0, 0.0, ww(), hh()).d2d(), &t.brush);
 
-        self.fill(t, &PROMPT, 14.0, color(CARD, 1.0));
-        self.stroke(t, &PROMPT, 14.0, color(CONTROL_BORDER, 1.0));
+        let p = prompt();
+        self.fill(t, &p, 14.0, color(CARD, 1.0));
+        self.stroke(t, &p, 14.0, color(CONTROL_BORDER, 1.0));
 
         // App logo tile, as on the desktop shortcut.
-        let cx = WIDTH / 2.0;
-        let logo = rc(cx - 24.0, PROMPT.t + 24.0, cx + 24.0, PROMPT.t + 72.0);
+        let cx = ww() / 2.0;
+        let logo = rc(cx - 24.0, p.t + 24.0, cx + 24.0, p.t + 72.0);
         self.fill(t, &logo, 12.0, color(0x16161C, 1.0));
         self.stroke(t, &logo, 12.0, color(BORDER, 1.0));
         let heights = [11.0, 22.0, 32.0, 18.0, 26.0];
@@ -582,16 +703,17 @@ impl Gfx {
             t.rt.FillRoundedRectangle(&rr, &t.brush);
         }
 
-        self.text(t, "Add SAR to your desktop?", &self.title, &rc(PROMPT.l, PROMPT.t + 84.0, PROMPT.r, PROMPT.t + 110.0), color(TEXT, 1.0), Align::Center);
-        self.text(t, "One click to open the recorder.", &self.small, &rc(PROMPT.l, PROMPT.t + 110.0, PROMPT.r, PROMPT.t + 128.0), color(MUTED, 1.0), Align::Center);
-        self.text(t, "Also adds it to the Start menu.", &self.small, &rc(PROMPT.l, PROMPT.t + 127.0, PROMPT.r, PROMPT.t + 145.0), color(MUTED, 1.0), Align::Center);
+        self.text(t, "Add SAR to your desktop?", &self.title, &rc(p.l, p.t + 84.0, p.r, p.t + 110.0), color(TEXT, 1.0), Align::Center);
+        self.text(t, "One click to open the recorder.", &self.small, &rc(p.l, p.t + 110.0, p.r, p.t + 128.0), color(MUTED, 1.0), Align::Center);
+        self.text(t, "Also adds it to the Start menu.", &self.small, &rc(p.l, p.t + 127.0, p.r, p.t + 145.0), color(MUTED, 1.0), Align::Center);
 
         let hov = |h: Hit| v.hover == Some(h);
-        self.fill(t, &PROMPT_NO, 10.0, color(if hov(Hit::ShortcutNo) { CONTROL_HOVER } else { CONTROL }, 1.0));
-        self.stroke(t, &PROMPT_NO, 10.0, color(CONTROL_BORDER, 1.0));
-        self.text(t, "No thanks", &self.button, &PROMPT_NO, color(TEXT, 1.0), Align::Center);
-        self.fill(t, &PROMPT_YES, 10.0, color(if hov(Hit::ShortcutYes) { ACCENT_HOVER } else { ACCENT }, 1.0));
-        self.text(t, "Add shortcut", &self.button, &PROMPT_YES, color(0xFFFFFF, 1.0), Align::Center);
+        let (no, yes) = (prompt_no(), prompt_yes());
+        self.fill(t, &no, 10.0, color(if hov(Hit::ShortcutNo) { CONTROL_HOVER } else { CONTROL }, 1.0));
+        self.stroke(t, &no, 10.0, color(CONTROL_BORDER, 1.0));
+        self.text(t, "No thanks", &self.button, &no, color(TEXT, 1.0), Align::Center);
+        self.fill(t, &yes, 10.0, color(if hov(Hit::ShortcutYes) { ACCENT_HOVER } else { ACCENT }, 1.0));
+        self.text(t, "Add shortcut", &self.button, &yes, color(0xFFFFFF, 1.0), Align::Center);
     }
 
     unsafe fn status_pill(&self, t: &Target, recording: bool) {
@@ -626,6 +748,7 @@ impl Gfx {
     unsafe fn editor(&self, t: &Target, v: &View, e: &EditorView) {
         let muted = color(MUTED, 1.0);
         let hov = |h: Hit| v.hover == Some(h);
+        let (va, vb) = (e.view_start, e.view_end);
 
         // Header: back button + file name + status
         self.fill(t, &BACK, 8.0, color(if hov(Hit::Back) { CONTROL_HOVER } else { CONTROL }, 1.0));
@@ -639,16 +762,19 @@ impl Gfx {
         self.status_pill(t, v.recording);
 
         // Waveform card
-        self.card(t, &E_WAVE_CARD);
-        let cy = (E_WAVE.t + E_WAVE.b) / 2.0;
-        let half = (E_WAVE.b - E_WAVE.t) / 2.0;
-        let xs = wave_x(e.start, e.duration);
-        let xe = wave_x(e.end, e.duration);
+        self.card(t, &e_wave_card());
+        let wv = e_wave();
+        let cy = (wv.t + wv.b) / 2.0;
+        let half = (wv.b - wv.t) / 2.0;
+        let xs = wave_x(e.start, va, vb);
+        let xe = wave_x(e.end, va, vb);
+        // Everything inside the waveform is clipped to it (handles may be off-screen when zoomed).
+        t.rt.PushAxisAlignedClip(&rc(wv.l - 7.0, wv.t - 5.0, wv.r + 7.0, wv.b + 5.0).d2d(), D2D1_ANTIALIAS_MODE_ALIASED);
         t.brush.SetColor(&color(ACCENT, 0.07));
-        t.rt.FillRectangle(&rc(xs, E_WAVE.t, xe, E_WAVE.b).d2d(), &t.brush);
-        let step = (WAVE_R - WAVE_L) / e.columns.len().max(1) as f32;
+        t.rt.FillRectangle(&rc(xs.max(wv.l), wv.t, xe.min(wv.r), wv.b).d2d(), &t.brush);
+        let step = (wv.r - wv.l) / e.columns.len().max(1) as f32;
         for (i, &p) in e.columns.iter().enumerate() {
-            let x = WAVE_L + i as f32 * step;
+            let x = wv.l + i as f32 * step;
             let h = 2.0 + p.powf(0.7) * (half * 2.0 - 6.0);
             let bar = rc(x, cy - h / 2.0, x + step * 0.7, cy + h / 2.0);
             let mid = x + step * 0.35;
@@ -662,10 +788,13 @@ impl Gfx {
         }
         // Handles
         for (x, is_start) in [(xs, true), (xe, false)] {
+            if x < wv.l - 7.0 || x > wv.r + 7.0 {
+                continue;
+            }
             let active = is_start == e.active_start;
             let c = if active { color(0xFFFFFF, 1.0) } else { color(0xB4B4BC, 1.0) };
             t.brush.SetColor(&c);
-            t.rt.FillRectangle(&rc(x - 1.0, E_WAVE.t - 4.0, x + 1.0, E_WAVE.b + 4.0).d2d(), &t.brush);
+            t.rt.FillRectangle(&rc(x - 1.0, wv.t - 4.0, x + 1.0, wv.b + 4.0).d2d(), &t.brush);
             let grip = rc(x - 6.0, cy - 15.0, x + 6.0, cy + 15.0);
             self.fill(t, &grip, 5.0, c);
             t.brush.SetColor(&color(0x3A3A44, 1.0));
@@ -675,27 +804,57 @@ impl Gfx {
         }
         // Playhead
         if e.playing || (e.playhead > e.start + 0.01 && e.playhead < e.end - 0.01) {
-            let x = wave_x(e.playhead, e.duration);
+            let x = wave_x(e.playhead, va, vb);
             t.brush.SetColor(&color(0xFFFFFF, 0.9));
-            t.rt.FillRectangle(&rc(x - 0.75, E_WAVE.t, x + 0.75, E_WAVE.b).d2d(), &t.brush);
-            self.circle(t, x, E_WAVE.t, 3.5, color(0xFFFFFF, 1.0));
+            t.rt.FillRectangle(&rc(x - 0.75, wv.t, x + 0.75, wv.b).d2d(), &t.brush);
+            self.circle(t, x, wv.t, 3.5, color(0xFFFFFF, 1.0));
         }
-        // Labels under the waveform
-        let lab = rc(INNER, 242.0, RIGHT, 260.0);
-        self.text(t, &fmt_precise(0.0), &self.small, &lab, color(FAINT, 1.0), Align::Left);
-        self.text(t, &fmt_precise(e.duration), &self.small, &lab, color(FAINT, 1.0), Align::Right);
+        t.rt.PopAxisAlignedClip();
+
+        // Overview strip: the whole file, with the visible part highlighted.
+        let ov = e_overview();
+        self.fill(t, &ov, 4.0, color(0x18181D, 1.0));
+        let ocy = (ov.t + ov.b) / 2.0;
+        let ostep = (ov.r - ov.l) / e.overview.len().max(1) as f32;
+        // Scale to the loudest part so quiet recordings still show a shape.
+        let omax = e.overview.iter().copied().fold(0.0f32, f32::max).max(0.02);
+        let (oxs, oxe) = (ov.l + (e.start / e.duration.max(1e-9)) as f32 * (ov.r - ov.l), ov.l + (e.end / e.duration.max(1e-9)) as f32 * (ov.r - ov.l));
+        for (i, &p) in e.overview.iter().enumerate() {
+            let x = ov.l + i as f32 * ostep;
+            let h = 1.0 + (p / omax).powf(0.7) * (ov.b - ov.t - 6.0);
+            let inside = x >= oxs && x <= oxe;
+            t.brush.SetColor(&color(if inside { 0x6C6CF7 } else { 0x34343C }, if inside { 0.75 } else { 1.0 }));
+            t.rt.FillRectangle(&rc(x, ocy - h / 2.0, x + ostep * 0.8, ocy + h / 2.0).d2d(), &t.brush);
+        }
+        let zoomed = vb - va < e.duration - 1e-6;
+        if zoomed {
+            let vx1 = ov.l + (va / e.duration.max(1e-9)) as f32 * (ov.r - ov.l);
+            let vx2 = (ov.l + (vb / e.duration.max(1e-9)) as f32 * (ov.r - ov.l)).max(vx1 + 4.0);
+            let win = rc(vx1, ov.t - 2.0, vx2, ov.b + 2.0);
+            self.fill(t, &win, 4.0, color(0xFFFFFF, if hov(Hit::Overview) { 0.14 } else { 0.08 }));
+            self.stroke(t, &win, 4.0, color(0xFFFFFF, 0.55));
+        }
+
+        // Labels under the waveform: visible range + selection length
+        let lab = e_labels();
+        self.text(t, &fmt_precise(va), &self.small, &lab, color(FAINT, 1.0), Align::Left);
+        self.text(t, &fmt_precise(vb), &self.small, &lab, color(FAINT, 1.0), Align::Right);
         let len = format!("Length  {}", fmt_precise(e.end - e.start));
         self.text(t, &len, &self.body_bold, &lab, color(TEXT, 1.0), Align::Center);
         let hint = match e.loading {
             Some(p) => format!("Loading waveform\u{2026}  {}%", (p * 100.0) as u32),
-            None => "Drag the handles to cut  \u{00B7}  Space to play  \u{00B7}  \u{2190} \u{2192} to fine-tune".to_string(),
+            None if zoomed => {
+                let zoom = e.duration / (vb - va).max(1e-9);
+                format!("Zoom {:.0}\u{00D7}  \u{00B7}  Scroll to zoom  \u{00B7}  Shift + scroll to move  \u{00B7}  Drag the strip", zoom)
+            }
+            None => "Drag the handles to cut  \u{00B7}  Scroll to zoom  \u{00B7}  Space to play".to_string(),
         };
-        self.text(t, &hint, &self.small, &rc(INNER, 266.0, RIGHT, 284.0), muted, Align::Center);
+        self.text(t, &hint, &self.small, &e_hint(), muted, Align::Center);
 
         // Start / End rows
-        self.card(t, &E_TRIM_CARD);
+        self.card(t, &e_trim_card());
         t.brush.SetColor(&color(DIVIDER, 1.0));
-        t.rt.FillRectangle(&rc(INNER, e_row(1), RIGHT, e_row(1) + 1.0).d2d(), &t.brush);
+        t.rt.FillRectangle(&rc(INNER, e_row(1), right(), e_row(1) + 1.0).d2d(), &t.brush);
         let rows = [
             ("Start", e.start, e.start, Hit::StartMinus, Hit::StartPlus, Hit::PlayStart, e.active_start),
             ("End", e.end, e.duration - e.end, Hit::EndMinus, Hit::EndPlus, Hit::PlayEnd, !e.active_start),
@@ -704,7 +863,7 @@ impl Gfx {
             let top = e_row(i);
             let lc = if active { color(ACCENT_HOVER, 1.0) } else { color(TEXT, 1.0) };
             self.text(t, label, &self.body_bold, &rc(INNER, top + 7.0, e_time(i).l - 6.0, top + 26.0), lc, Align::Left);
-            let sub = if cut >= 0.05 { format!("Cuts {}", fmt_secs(cut)) } else { "Nothing cut".to_string() };
+            let sub = if cut >= 0.005 { format!("Cuts {}", fmt_secs(cut)) } else { "Nothing cut".to_string() };
             self.text(t, &sub, &self.small, &rc(INNER, top + 26.0, e_time(i).l - 6.0, top + 43.0), muted, Align::Left);
             self.text(t, &fmt_precise(at), &self.body_bold, &e_time(i), color(TEXT, 1.0), Align::Right);
             self.chip_button(t, &e_minus(i), "\u{2212}", hov(minus), true);
@@ -716,26 +875,28 @@ impl Gfx {
         }
 
         // Play / pause
-        self.fill(t, &E_PLAY, 10.0, color(if hov(Hit::PlayPause) { CONTROL_HOVER } else { CONTROL }, 1.0));
-        self.stroke(t, &E_PLAY, 10.0, color(CONTROL_BORDER, 1.0));
+        let pb = e_play_btn();
+        self.fill(t, &pb, 10.0, color(if hov(Hit::PlayPause) { CONTROL_HOVER } else { CONTROL }, 1.0));
+        self.stroke(t, &pb, 10.0, color(CONTROL_BORDER, 1.0));
         let label = if e.playing { "Pause" } else { "Play selection" };
         let tw = self.text_width(label, &self.button);
-        let (cx, cy) = ((E_PLAY.l + E_PLAY.r) / 2.0, (E_PLAY.t + E_PLAY.b) / 2.0);
+        let (cx, cy) = ((pb.l + pb.r) / 2.0, (pb.t + pb.b) / 2.0);
         let ix = cx - (tw + 20.0) / 2.0;
         if e.playing {
             self.pause_icon(t, ix + 5.0, cy, 11.0, color(TEXT, 1.0));
         } else {
             self.play_icon(t, ix + 5.0, cy, 11.0, color(TEXT, 1.0));
         }
-        self.text(t, label, &self.button, &rc(ix + 20.0, E_PLAY.t, E_PLAY.r, E_PLAY.b), color(TEXT, 1.0), Align::Left);
+        self.text(t, label, &self.button, &rc(ix + 20.0, pb.t, pb.r, pb.b), color(TEXT, 1.0), Align::Left);
 
         // Save buttons
         let a = if e.loading.is_none() { 1.0 } else { 0.45 };
-        self.fill(t, &E_SAVE, 10.0, color(if hov(Hit::SaveCopy) { ACCENT_HOVER } else { ACCENT }, a));
-        self.text(t, "Save as copy", &self.button, &E_SAVE, color(0xFFFFFF, a), Align::Center);
-        self.fill(t, &E_REPLACE, 10.0, color(if hov(Hit::Replace) { CONTROL_HOVER } else { CONTROL }, a));
-        self.stroke(t, &E_REPLACE, 10.0, color(CONTROL_BORDER, a));
-        self.text(t, "Replace original", &self.button, &E_REPLACE, color(TEXT, a), Align::Center);
+        let (sv, rp) = (e_save(), e_replace());
+        self.fill(t, &sv, 10.0, color(if hov(Hit::SaveCopy) { ACCENT_HOVER } else { ACCENT }, a));
+        self.text(t, "Save as copy", &self.button, &sv, color(0xFFFFFF, a), Align::Center);
+        self.fill(t, &rp, 10.0, color(if hov(Hit::Replace) { CONTROL_HOVER } else { CONTROL }, a));
+        self.stroke(t, &rp, 10.0, color(CONTROL_BORDER, a));
+        self.text(t, "Replace original", &self.button, &rp, color(TEXT, a), Align::Center);
 
         // Footer
         let c = match v.footer_kind {
@@ -745,7 +906,7 @@ impl Gfx {
             FooterKind::Info => Some(muted),
         };
         if let Some(c) = c {
-            self.text(t, v.footer, &self.small, &E_FOOTER, c, Align::Center);
+            self.text(t, v.footer, &self.small, &e_footer(), c, Align::Center);
         }
     }
 
@@ -774,29 +935,34 @@ impl Gfx {
     }
 
     unsafe fn recorder_card(&self, t: &Target, v: &View) {
-        self.card(t, &REC_CARD);
+        self.card(t, &rec_card());
 
-        // Waveform
+        // Waveform: as many bars as fit; newest level on the right.
+        let bars = wave_bars();
         let bar_w = 3.0;
         let gap = 3.0;
-        let total = WAVE_BARS as f32 * (bar_w + gap) - gap;
-        let x0 = INNER + ((RIGHT - INNER) - total) / 2.0;
+        let total = bars as f32 * (bar_w + gap) - gap;
+        let x0 = INNER + ((right() - INNER) - total) / 2.0;
+        let (wcy, whalf) = (wave_cy(), wave_half());
         if !v.recording {
             t.brush.SetColor(&color(0x26262E, 1.0));
         }
-        for i in 0..WAVE_BARS {
+        let skip = v.waves.len().saturating_sub(bars);
+        let shown = &v.waves[skip..];
+        let pad = bars - shown.len();
+        for i in 0..bars {
             let h = if v.recording {
-                let lvl = v.waves.get(i).copied().unwrap_or(0.0);
-                3.0 + lvl * (WAVE_HALF * 2.0 - 3.0)
+                let lvl = if i < pad { 0.0 } else { shown[i - pad] };
+                3.0 + lvl * (whalf * 2.0 - 3.0)
             } else {
                 // Calm static wave while idle: a soft bell-shaped ripple.
-                let p = i as f32 / (WAVE_BARS - 1) as f32;
+                let p = i as f32 / (bars - 1).max(1) as f32;
                 let bell = (p * std::f32::consts::PI).sin().powf(1.5);
                 let ripple = 0.55 + 0.45 * (p * 23.0).sin() * (p * 7.0 + 1.0).cos();
-                3.0 + 22.0 * bell * ripple.abs()
+                3.0 + (22.0 + extra() * 0.3) * bell * ripple.abs()
             };
             let x = x0 + i as f32 * (bar_w + gap);
-            let bar = rc(x, WAVE_CY - h / 2.0, x + bar_w, WAVE_CY + h / 2.0);
+            let bar = rc(x, wcy - h / 2.0, x + bar_w, wcy + h / 2.0);
             let rr = D2D1_ROUNDED_RECT { rect: bar.d2d(), radiusX: 1.5, radiusY: 1.5 };
             if v.recording {
                 t.rt.FillRoundedRectangle(&rr, &t.wave);
@@ -809,7 +975,7 @@ impl Gfx {
         let s = v.secs;
         let time = format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60);
         let tc = if v.recording { color(TEXT, 1.0) } else { color(FAINT, 1.0) };
-        self.text(t, &time, &self.timer, &TIMER, tc, Align::Center);
+        self.text(t, &time, &self.timer, &timer(), tc, Align::Center);
         let sub = if v.recording {
             "Recording system audio  \u{00B7}  microphone is never recorded".to_string()
         } else if v.hotkey_ok {
@@ -817,26 +983,27 @@ impl Gfx {
         } else {
             "Set a hotkey below to record from anywhere".to_string()
         };
-        self.text(t, &sub, &self.small, &TIMER_SUB, color(MUTED, 1.0), Align::Center);
+        self.text(t, &sub, &self.small, &timer_sub(), color(MUTED, 1.0), Align::Center);
 
         // Big button
+        let btn = record_btn();
         let hover = v.hover == Some(Hit::Record);
         let (fill, label) = if v.recording {
             (if hover { RED_HOVER } else { RED_FILL }, "Stop Recording")
         } else {
             (if hover { ACCENT_HOVER } else { ACCENT }, "Start Recording")
         };
-        self.fill(t, &RECORD_BTN, 10.0, color(fill, 1.0));
+        self.fill(t, &btn, 10.0, color(fill, 1.0));
         let tw = self.text_width(label, &self.button);
-        let cx = (RECORD_BTN.l + RECORD_BTN.r) / 2.0;
-        let cy = (RECORD_BTN.t + RECORD_BTN.b) / 2.0;
+        let cx = (btn.l + btn.r) / 2.0;
+        let cy = (btn.t + btn.b) / 2.0;
         let icon_x = cx - (tw + 18.0) / 2.0;
         if v.recording {
             self.fill(t, &rc(icon_x, cy - 4.5, icon_x + 9.0, cy + 4.5), 2.0, color(0xFFFFFF, 1.0));
         } else {
             self.circle(t, icon_x + 4.5, cy, 4.5, color(0xFFFFFF, 1.0));
         }
-        self.text(t, label, &self.button, &rc(icon_x + 18.0, RECORD_BTN.t, RECORD_BTN.r, RECORD_BTN.b), color(0xFFFFFF, 1.0), Align::Left);
+        self.text(t, label, &self.button, &rc(icon_x + 18.0, btn.t, btn.r, btn.b), color(0xFFFFFF, 1.0), Align::Left);
     }
 
     unsafe fn row_labels(&self, t: &Target, i: usize, label: &str, sub: &str, sub_color: D2D1_COLOR_F, right_limit: f32) {
@@ -846,11 +1013,12 @@ impl Gfx {
     }
 
     unsafe fn settings(&self, t: &Target, v: &View) {
-        self.text(t, "SETTINGS", &self.caps, &rc(PAD + 2.0, SETTINGS_LABEL_Y - 8.0, 200.0, SETTINGS_LABEL_Y + 8.0), color(MUTED, 1.0), Align::Left);
-        self.card(t, &SET_CARD);
+        let ly = settings_label_y();
+        self.text(t, "SETTINGS", &self.caps, &rc(PAD + 2.0, ly - 8.0, 200.0, ly + 8.0), color(MUTED, 1.0), Align::Left);
+        self.card(t, &set_card());
         for i in 1..ROWS {
             t.brush.SetColor(&color(DIVIDER, 1.0));
-            t.rt.FillRectangle(&rc(INNER, row_top(i), RIGHT, row_top(i) + 1.0).d2d(), &t.brush);
+            t.rt.FillRectangle(&rc(INNER, row_top(i), right(), row_top(i) + 1.0).d2d(), &t.brush);
         }
         let muted = color(MUTED, 1.0);
 
@@ -904,9 +1072,9 @@ impl Gfx {
         self.segmented(t, &seg, &q, v.hover, !v.recording && v.format != 0);
 
         // 4, 5: toggles
-        self.row_labels(t, 4, "Keep running in tray", "Closing the window keeps the hotkey active", muted, RIGHT - 50.0);
+        self.row_labels(t, 4, "Keep running in tray", "Closing the window keeps the hotkey active", muted, right() - 50.0);
         self.toggle(t, &toggle(4), v.tray, v.hover == Some(Hit::Tray));
-        self.row_labels(t, 5, "Start with Windows", "Launches quietly in the tray", muted, RIGHT - 50.0);
+        self.row_labels(t, 5, "Start with Windows", "Launches quietly in the tray", muted, right() - 50.0);
         self.toggle(t, &toggle(5), v.startup, v.hover == Some(Hit::Startup));
     }
 
@@ -948,12 +1116,14 @@ impl Gfx {
             FooterKind::Error => color(RED, 1.0),
             FooterKind::Info => color(MUTED, 1.0),
         };
+        let f = footer_rect();
+        let line = rc(f.l, f.t, f.r, f.t + 26.0);
         if v.footer_kind == FooterKind::Success && v.can_trim {
             let chip = footer_trim_chip();
-            self.text(t, v.footer, &self.small, &rc(FOOTER.l, FOOTER.t, chip.l - 8.0, FOOTER.b), c, Align::Left);
+            self.text(t, v.footer, &self.small, &rc(line.l, line.t, chip.l - 8.0, line.b), c, Align::Left);
             self.chip_button(t, &chip, "Trim", v.hover == Some(Hit::FooterTrim), true);
         } else {
-            self.text(t, v.footer, &self.small, &FOOTER, c, Align::Center);
+            self.text(t, v.footer, &self.small, &line, c, Align::Center);
         }
     }
 }

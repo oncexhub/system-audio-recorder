@@ -1,6 +1,6 @@
 [package]
 name = "sysrec"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Tiny native Windows app that records system audio with one hotkey"
 license = "MIT"

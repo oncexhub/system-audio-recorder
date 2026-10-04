@@ -15,6 +15,10 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// The first-run "Add SAR to your desktop?" question was answered.
     pub shortcut_asked: bool,
+    /// Last client size in 96-DPI units (0 = default) and maximized state.
+    pub window_w: u32,
+    pub window_h: u32,
+    pub maximized: bool,
 }
 
 const HOTKEYF_CONTROL: u16 = 0x02;
@@ -33,6 +37,9 @@ impl Settings {
             bitrate: 192,
             close_to_tray: true,
             shortcut_asked: false,
+            window_w: 0,
+            window_h: 0,
+            maximized: false,
         };
         if let Ok(text) = std::fs::read_to_string(file()) {
             for line in text.lines() {
@@ -51,6 +58,9 @@ impl Settings {
                     "bitrate" => s.bitrate = v.parse().ok().filter(|b| crate::ui::BITRATES.contains(b)).unwrap_or(s.bitrate),
                     "close_to_tray" => s.close_to_tray = v != "0",
                     "shortcut_asked" => s.shortcut_asked = v == "1",
+                    "window_w" => s.window_w = v.parse().unwrap_or(0),
+                    "window_h" => s.window_h = v.parse().unwrap_or(0),
+                    "maximized" => s.maximized = v == "1",
                     _ => {}
                 }
             }
@@ -64,13 +74,16 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "hotkey={}\nfolder={}\nformat={}\nbitrate={}\nclose_to_tray={}\nshortcut_asked={}\n",
+            "hotkey={}\nfolder={}\nformat={}\nbitrate={}\nclose_to_tray={}\nshortcut_asked={}\nwindow_w={}\nwindow_h={}\nmaximized={}\n",
             self.hotkey,
             self.folder.display(),
             self.format.ext(),
             self.bitrate,
             self.close_to_tray as u8,
-            self.shortcut_asked as u8
+            self.shortcut_asked as u8,
+            self.window_w,
+            self.window_h,
+            self.maximized as u8
         );
         let _ = std::fs::write(path, text);
     }

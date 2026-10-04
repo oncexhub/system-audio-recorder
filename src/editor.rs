@@ -64,7 +64,12 @@ pub struct Editor {
     loader: Option<JoinHandle<()>>,
     player: Option<Player>,
     end_is_default: bool,
+    /// Visible part of the waveform (seconds); `None` = whole file.
+    view: Option<(f64, f64)>,
 }
+
+/// Narrowest zoom: this many seconds across the waveform.
+const MIN_VIEW: f64 = 0.25;
 
 impl Editor {
     pub fn open(path: PathBuf) -> Result<Editor, String> {
@@ -102,6 +107,7 @@ impl Editor {
             loader: Some(loader),
             player: None,
             end_is_default: true,
+            view: None,
         })
     }
 
@@ -140,18 +146,17 @@ impl Editor {
         }
     }
 
-    /// Peak level per display column (0..1).
-    pub fn columns(&self, n: usize) -> Vec<f32> {
+    /// Peak level per display column (0..1) for the time range `from..to`.
+    pub fn columns(&self, n: usize, from: f64, to: f64) -> Vec<f32> {
         let mut out = vec![0.0; n];
         let Ok(w) = self.wave.lock() else { return out };
-        let dur = w.duration.unwrap_or(w.estimated);
-        if dur <= 0.0 || w.block_secs <= 0.0 {
+        if to <= from || w.block_secs <= 0.0 || n == 0 {
             return out;
         }
-        let per_col = dur / n as f64;
+        let per_col = (to - from) / n as f64;
         for (c, o) in out.iter_mut().enumerate() {
-            let a = ((c as f64 * per_col) / w.block_secs) as usize;
-            let b = ((((c + 1) as f64 * per_col) / w.block_secs).ceil() as usize).max(a + 1);
+            let a = ((from + c as f64 * per_col) / w.block_secs) as usize;
+            let b = (((from + (c + 1) as f64 * per_col) / w.block_secs).ceil() as usize).max(a + 1);
             let mut m = 0.0f32;
             for i in a..b.min(w.peaks.len()) {
                 m = m.max(w.peaks[i]);
@@ -161,9 +166,72 @@ impl Editor {
         out
     }
 
+    /// Visible time range of the waveform.
+    pub fn view(&self) -> (f64, f64) {
+        let d = self.duration();
+        match self.view {
+            Some((a, b)) => (a.max(0.0), b.min(d)),
+            None => (0.0, d),
+        }
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// Zooms in (factor > 1) or out (< 1), keeping time `at` in place.
+    pub fn zoom(&mut self, factor: f64, at: f64) {
+        let d = self.duration();
+        let (a, b) = self.view();
+        let span = ((b - a) / factor).clamp(MIN_VIEW.min(d), d);
+        if span >= d - 1e-9 {
+            self.view = None;
+            return;
+        }
+        let rel = if b > a { (at - a) / (b - a) } else { 0.5 };
+        let na = at - rel * span;
+        self.set_view(na, na + span);
+    }
+
+    /// Moves the view by `by` seconds.
+    pub fn pan(&mut self, by: f64) {
+        if let Some((a, b)) = self.view {
+            self.set_view(a + by, b + by);
+        }
+    }
+
+    /// Centers the view on `t` (keeps the zoom level).
+    pub fn center_on(&mut self, t: f64) {
+        if let Some((a, b)) = self.view {
+            let half = (b - a) / 2.0;
+            self.set_view(t - half, t + half);
+        }
+    }
+
+    pub fn fit(&mut self) {
+        self.view = None;
+    }
+
+    fn set_view(&mut self, a: f64, b: f64) {
+        let d = self.duration();
+        let span = (b - a).min(d);
+        let a = a.clamp(0.0, (d - span).max(0.0));
+        self.view = Some((a, a + span));
+    }
+
+    /// While playing, page the view along so the playhead stays visible.
+    pub fn follow_playhead(&mut self) {
+        if let (Some((a, b)), true) = (self.view, self.is_playing()) {
+            if self.playhead > b || self.playhead < a {
+                let span = b - a;
+                self.set_view(self.playhead - span * 0.1, self.playhead + span * 0.9);
+            }
+        }
+    }
+
     pub fn set_handle(&mut self, h: Handle, t: f64) {
         let dur = self.duration();
-        const MIN_LEN: f64 = 0.1;
+        const MIN_LEN: f64 = 0.05;
         match h {
             Handle::Start => self.start = t.clamp(0.0, (self.end - MIN_LEN).max(0.0)),
             Handle::End => {
@@ -320,7 +388,7 @@ fn load_wave(path: &Path, wave: &Mutex<Wave>, cancel: &AtomicBool) {
     };
     let est = unsafe { duration_of(&r.reader) }.max(0.001);
     // Fine enough for precise trimming, small enough for hours-long files.
-    let block_secs = (est / 40_000.0).max(0.005);
+    let block_secs = (est / 400_000.0).max(0.002);
     let block = ((block_secs * r.rate as f64) as usize).max(1);
     if let Ok(mut w) = wave.lock() {
         w.estimated = est;
