@@ -48,7 +48,7 @@ pub struct Recorder {
 impl Recorder {
     /// Starts recording. Returns once the file and audio device are open, so
     /// any setup error is reported immediately.
-    pub fn start(path: PathBuf, format: Format, notify: HWND) -> Result<Recorder, String> {
+    pub fn start(path: PathBuf, format: Format, kbps: u32, notify: HWND) -> Result<Recorder, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
         let levels = Arc::new(Mutex::new(Vec::new()));
@@ -58,7 +58,7 @@ impl Recorder {
         let thread = std::thread::Builder::new()
             .name("capture".into())
             .spawn(move || {
-                let r = run(&p, format, &s, &f, &l, tx);
+                let r = run(&p, format, kbps, &s, &f, &l, tx);
                 if r.is_err() && !s.load(Ordering::SeqCst) {
                     unsafe {
                         let _ = PostMessageW(Some(HWND(hwnd as _)), WM_RECORDER_FAILED, WPARAM(0), LPARAM(0));
@@ -105,6 +105,7 @@ impl Recorder {
 fn run(
     path: &PathBuf,
     format: Format,
+    kbps: u32,
     stop: &AtomicBool,
     frames: &AtomicU64,
     levels: &Mutex<Vec<f32>>,
@@ -115,7 +116,7 @@ fn run(
     }
     raise_thread_priority();
 
-    let mut sink = match Sink::create(path, format) {
+    let mut sink = match Sink::create(path, format, kbps) {
         Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(e.clone()));

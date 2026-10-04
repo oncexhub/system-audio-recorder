@@ -2,6 +2,7 @@
 
 mod capture;
 mod editor;
+mod mp4;
 mod settings;
 mod shortcut;
 mod sink;
@@ -437,7 +438,12 @@ fn make_view<'a>(a: &App, hk: &'a str, folder: &'a str, waves: &'a [f32], footer
         hotkey_ok: a.hotkey_ok,
         capturing_hotkey: a.capturing_hotkey,
         folder,
-        mp3: a.settings.format == Format::Mp3,
+        format: match a.settings.format {
+            Format::Wav => 0,
+            Format::Mp3 => 1,
+            Format::M4a => 2,
+        },
+        kbps: a.settings.bitrate,
         tray: a.settings.close_to_tray,
         startup: a.startup,
         footer,
@@ -551,8 +557,16 @@ unsafe fn on_click(h: Hit) {
             }
         }
         Hit::FolderOpen => open_folder(),
-        Hit::FormatWav | Hit::FormatMp3 => {
-            a.settings.format = if h == Hit::FormatMp3 { Format::Mp3 } else { Format::Wav };
+        Hit::Bitrate(i) => {
+            a.settings.bitrate = ui::BITRATES[i as usize];
+            a.settings.save();
+        }
+        Hit::FormatWav | Hit::FormatMp3 | Hit::FormatM4a => {
+            a.settings.format = match h {
+                Hit::FormatMp3 => Format::Mp3,
+                Hit::FormatM4a => Format::M4a,
+                _ => Format::Wav,
+            };
             a.settings.save();
         }
         Hit::Tray => {
@@ -797,7 +811,7 @@ unsafe fn save_trim(replace: bool) {
 unsafe fn pick_audio_file() -> Option<PathBuf> {
     let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
     let filters = [
-        Common::COMDLG_FILTERSPEC { pszName: w!("Recordings (*.wav, *.mp3)"), pszSpec: w!("*.wav;*.mp3") },
+        Common::COMDLG_FILTERSPEC { pszName: w!("Recordings (*.wav, *.mp3, *.m4a)"), pszSpec: w!("*.wav;*.mp3;*.m4a") },
     ];
     let _ = dlg.SetFileTypes(&filters);
     let _ = dlg.SetTitle(w!("Choose a recording to trim"));
@@ -965,7 +979,7 @@ unsafe fn start_recording() {
         return;
     }
     let path = new_file_path(&folder, a.settings.format.ext());
-    match Recorder::start(path, a.settings.format, a.hwnd) {
+    match Recorder::start(path, a.settings.format, a.settings.kbps(), a.hwnd) {
         Ok(r) => {
             a.recorder = Some(r);
             a.waves.clear();

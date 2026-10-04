@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows_numerics::Vector2;
 
 pub const WIDTH: f32 = 460.0;
-pub const HEIGHT: f32 = 628.0;
+pub const HEIGHT: f32 = 678.0;
 
 pub const WAVE_BARS: usize = 62;
 
@@ -48,6 +48,9 @@ pub enum Hit {
     FolderOpen,
     FormatWav,
     FormatMp3,
+    FormatM4a,
+    /// Index into `BITRATES`.
+    Bitrate(u8),
     Tray,
     Startup,
     Footer,
@@ -85,7 +88,9 @@ pub struct View<'a> {
     pub hotkey_ok: bool,
     pub capturing_hotkey: bool,
     pub folder: &'a str,
-    pub mp3: bool,
+    /// 0 = WAV, 1 = MP3, 2 = M4A
+    pub format: u8,
+    pub kbps: u32,
     pub tray: bool,
     pub startup: bool,
     pub footer: &'a str,
@@ -141,7 +146,10 @@ const RECORD_BTN: Rect = rc(INNER, 236.0, RIGHT, 276.0);
 const SETTINGS_LABEL_Y: f32 = 314.0;
 const SET_CARD_TOP: f32 = 334.0;
 const ROW_H: f32 = 50.0;
-const ROWS: usize = 5;
+const ROWS: usize = 6;
+
+/// Bitrates offered for MP3 and M4A (kbps).
+pub const BITRATES: [u32; 5] = [96, 128, 192, 256, 320];
 const SET_CARD: Rect = rc(PAD, SET_CARD_TOP, WIDTH - PAD, SET_CARD_TOP + ROW_H * ROWS as f32);
 const FOOTER: Rect = rc(PAD, SET_CARD_TOP + ROW_H * ROWS as f32 + 8.0, WIDTH - PAD, HEIGHT - 6.0);
 
@@ -164,7 +172,16 @@ fn folder_open() -> Rect {
     control_rect(1, RIGHT - 64.0, RIGHT)
 }
 fn format_seg() -> Rect {
-    control_rect(2, RIGHT - 124.0, RIGHT)
+    control_rect(2, RIGHT - 156.0, RIGHT)
+}
+fn quality_seg() -> Rect {
+    control_rect(3, RIGHT - 200.0, RIGHT)
+}
+
+/// Splits a segmented control into `n` equal parts.
+fn segments(r: &Rect, n: usize) -> Vec<Rect> {
+    let w = (r.r - r.l) / n as f32;
+    (0..n).map(|i| rc(r.l + w * i as f32, r.t, r.l + w * (i + 1) as f32, r.b)).collect()
 }
 fn toggle(i: usize) -> Rect {
     let t = row_top(i) + 15.0;
@@ -173,21 +190,26 @@ fn toggle(i: usize) -> Rect {
 
 /// Finds which interactive element is under a point (in 96-DPI units).
 pub fn hit_test(x: f32, y: f32, v: &View) -> Option<Hit> {
-    let seg = format_seg();
-    let mid = (seg.l + seg.r) / 2.0;
-    let candidates = [
+    let fmt = segments(&format_seg(), 3);
+    let mut candidates = vec![
         (RECORD_BTN, Hit::Record),
         (hotkey_chip(), Hit::Hotkey),
         (folder_change(), Hit::FolderChange),
         (folder_open(), Hit::FolderOpen),
-        (rc(seg.l, seg.t, mid, seg.b), Hit::FormatWav),
-        (rc(mid, seg.t, seg.r, seg.b), Hit::FormatMp3),
-        (rc(INNER, row_top(3), RIGHT, row_top(4)), Hit::Tray),
-        (rc(INNER, row_top(4), RIGHT, row_top(5)), Hit::Startup),
+        (rc(fmt[0].l, fmt[0].t, fmt[0].r, fmt[0].b), Hit::FormatWav),
+        (rc(fmt[1].l, fmt[1].t, fmt[1].r, fmt[1].b), Hit::FormatMp3),
+        (rc(fmt[2].l, fmt[2].t, fmt[2].r, fmt[2].b), Hit::FormatM4a),
+        (rc(INNER, row_top(4), RIGHT, row_top(5)), Hit::Tray),
+        (rc(INNER, row_top(5), RIGHT, row_top(6)), Hit::Startup),
     ];
+    if v.format != 0 {
+        for (i, r) in segments(&quality_seg(), BITRATES.len()).into_iter().enumerate() {
+            candidates.push((r, Hit::Bitrate(i as u8)));
+        }
+    }
     for (r, h) in candidates {
         if r.contains(x, y) {
-            let disabled = v.recording && matches!(h, Hit::FolderChange | Hit::FormatWav | Hit::FormatMp3);
+            let disabled = v.recording && matches!(h, Hit::FolderChange | Hit::FormatWav | Hit::FormatMp3 | Hit::FormatM4a | Hit::Bitrate(_));
             return if disabled { None } else { Some(h) };
         }
     }
@@ -854,29 +876,55 @@ impl Gfx {
 
         // 2: format
         let seg = format_seg();
-        let sub = if v.mp3 { "320 kbps  \u{00B7}  about 140 MB per hour" } else { "Lossless  \u{00B7}  about 690 MB per hour" };
+        let sub = match v.format {
+            1 => "Plays everywhere",
+            2 => "Smallest files for the same quality",
+            _ => "Lossless, largest files",
+        };
         self.row_labels(t, 2, "Format", sub, muted, seg.l - 10.0);
-        let alpha = if v.recording { 0.45 } else { 1.0 };
-        self.fill(t, &seg, 7.0, color(CONTROL, alpha));
-        self.stroke(t, &seg, 7.0, color(CONTROL_BORDER, alpha));
-        let mid = (seg.l + seg.r) / 2.0;
-        let halves = [(rc(seg.l, seg.t, mid, seg.b), "WAV", !v.mp3, Hit::FormatWav), (rc(mid, seg.t, seg.r, seg.b), "MP3", v.mp3, Hit::FormatMp3)];
-        for (r, label, selected, hit) in halves {
-            let inner = rc(r.l + 3.0, r.t + 3.0, r.r - 3.0, r.b - 3.0);
-            if selected {
+        let items = [("WAV", Hit::FormatWav), ("MP3", Hit::FormatMp3), ("M4A", Hit::FormatM4a)];
+        let fmt: Vec<_> = items.iter().enumerate().map(|(i, (l, h))| (*l, i as u8 == v.format, *h)).collect();
+        self.segmented(t, &seg, &fmt, v.hover, !v.recording);
+
+        // 3: quality
+        let seg = quality_seg();
+        let sub = if v.format == 0 {
+            "Lossless  \u{00B7}  ~690 MB/hour".to_string()
+        } else {
+            let mb = (v.kbps as f32 * 0.45).round() as u32;
+            if v.kbps == 192 { format!("Recommended  \u{00B7}  ~{mb} MB/hour") } else { format!("~{mb} MB per hour") }
+        };
+        self.row_labels(t, 3, "Quality", &sub, muted, seg.l - 10.0);
+        let labels: Vec<String> = BITRATES.iter().map(|b| b.to_string()).collect();
+        let q: Vec<_> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.as_str(), v.format != 0 && BITRATES[i] == v.kbps, Hit::Bitrate(i as u8)))
+            .collect();
+        self.segmented(t, &seg, &q, v.hover, !v.recording && v.format != 0);
+
+        // 4, 5: toggles
+        self.row_labels(t, 4, "Keep running in tray", "Closing the window keeps the hotkey active", muted, RIGHT - 50.0);
+        self.toggle(t, &toggle(4), v.tray, v.hover == Some(Hit::Tray));
+        self.row_labels(t, 5, "Start with Windows", "Launches quietly in the tray", muted, RIGHT - 50.0);
+        self.toggle(t, &toggle(5), v.startup, v.hover == Some(Hit::Startup));
+    }
+
+    /// Pill-shaped segmented control: (label, selected, hit) per segment.
+    unsafe fn segmented(&self, t: &Target, r: &Rect, items: &[(&str, bool, Hit)], hover: Option<Hit>, enabled: bool) {
+        let alpha = if enabled { 1.0 } else { 0.4 };
+        self.fill(t, r, 7.0, color(CONTROL, alpha));
+        self.stroke(t, r, 7.0, color(CONTROL_BORDER, alpha));
+        for (part, (label, selected, hit)) in segments(r, items.len()).iter().zip(items) {
+            let inner = rc(part.l + 3.0, part.t + 3.0, part.r - 3.0, part.b - 3.0);
+            if *selected {
                 self.fill(t, &inner, 5.0, color(0x30303A, alpha));
-            } else if v.hover == Some(hit) {
+            } else if enabled && hover == Some(*hit) {
                 self.fill(t, &inner, 5.0, color(CONTROL_HOVER, alpha));
             }
-            let c = if selected { color(TEXT, alpha) } else { color(MUTED, alpha) };
-            self.text(t, label, &self.body_bold, &r, c, Align::Center);
+            let c = if *selected { color(TEXT, alpha) } else { color(MUTED, alpha) };
+            self.text(t, label, &self.body_bold, part, c, Align::Center);
         }
-
-        // 3, 4: toggles
-        self.row_labels(t, 3, "Keep running in tray", "Closing the window keeps the hotkey active", muted, RIGHT - 50.0);
-        self.toggle(t, &toggle(3), v.tray, v.hover == Some(Hit::Tray));
-        self.row_labels(t, 4, "Start with Windows", "Launches quietly in the tray", muted, RIGHT - 50.0);
-        self.toggle(t, &toggle(4), v.startup, v.hover == Some(Hit::Startup));
     }
 
     unsafe fn toggle(&self, t: &Target, r: &Rect, on: bool, hover: bool) {

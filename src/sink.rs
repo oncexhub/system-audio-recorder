@@ -1,23 +1,25 @@
-//! Output files. Both writers take interleaved 16-bit stereo PCM at 48 kHz
+//! Output files. All writers take interleaved 16-bit stereo PCM at 48 kHz
 //! and stream it straight to disk, so memory use stays flat no matter how
 //! long a recording runs.
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use windows::core::HSTRING;
+use windows::core::{GUID, HSTRING};
 use windows::Win32::Media::MediaFoundation::*;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
 const BLOCK_ALIGN: u32 = CHANNELS * 2;
 
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Wav,
     Mp3,
+    M4a,
 }
 
 impl Format {
@@ -25,27 +27,37 @@ impl Format {
         match self {
             Format::Wav => "wav",
             Format::Mp3 => "mp3",
+            Format::M4a => "m4a",
         }
     }
 }
 
 pub enum Sink {
     Wav(WavWriter),
-    Mp3(Mp3Writer),
+    Mp3(EncodedWriter),
+    /// M4A is recorded as a raw AAC stream (playable even after a crash)
+    /// and wrapped into the .m4a container when recording stops.
+    M4a { aac: EncodedWriter, temp: PathBuf, dest: PathBuf },
 }
 
 impl Sink {
-    pub fn create(path: &Path, format: Format) -> Result<Sink, String> {
+    /// `kbps` is used for MP3 and M4A.
+    pub fn create(path: &Path, format: Format, kbps: u32) -> Result<Sink, String> {
         match format {
             Format::Wav => WavWriter::create(path).map(Sink::Wav),
-            Format::Mp3 => Mp3Writer::create(path).map(Sink::Mp3),
+            Format::Mp3 => EncodedWriter::create(path, Format::Mp3, kbps).map(Sink::Mp3),
+            Format::M4a => {
+                let temp = path.with_extension("aac");
+                let aac = EncodedWriter::create(&temp, Format::M4a, kbps)?;
+                Ok(Sink::M4a { aac, temp, dest: path.to_path_buf() })
+            }
         }
     }
 
     pub fn write(&mut self, samples: &[i16]) -> Result<(), String> {
         match self {
             Sink::Wav(w) => w.write(samples),
-            Sink::Mp3(w) => w.write(samples),
+            Sink::Mp3(w) | Sink::M4a { aac: w, .. } => w.write(samples),
         }
     }
 
@@ -53,6 +65,21 @@ impl Sink {
         match self {
             Sink::Wav(w) => w.finish(),
             Sink::Mp3(w) => w.finish(),
+            Sink::M4a { aac, temp, dest } => {
+                aac.finish()?;
+                match crate::mp4::adts_to_m4a(&temp, &dest) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&temp);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Keep the playable .aac so nothing is lost.
+                        let _ = std::fs::remove_file(&dest);
+                        Err(format!("{e}
+The recording was kept as {}", temp.display()))
+                    }
+                }
+            }
         }
     }
 }
@@ -157,41 +184,53 @@ fn io_err(e: std::io::Error) -> String {
     format!("Could not write to disk: {e}")
 }
 
-// ---------------------------------------------------------------- MP3 ----
+// ---------------------------------------------------- MP3 and M4A ----
 
-/// MP3 (320 kbps) through the encoder that ships with Windows (Media
+/// MP3 or M4A (AAC) through the encoders that ship with Windows (Media
 /// Foundation), so no extra libraries are needed.
-pub struct Mp3Writer {
+pub struct EncodedWriter {
     writer: IMFSinkWriter,
     stream: u32,
     pending: Vec<i16>,
     frames_done: u64,
+    name: &'static str,
 }
 
-const MP3_CHUNK_FRAMES: usize = (SAMPLE_RATE / 10) as usize; // 100 ms per sample
+const CHUNK_FRAMES: usize = (SAMPLE_RATE / 10) as usize; // 100 ms per sample
 
-impl Mp3Writer {
-    fn create(path: &Path) -> Result<Self, String> {
-        unsafe { Self::create_inner(path) }.map_err(|e| format!("MP3 encoder error: {}", e.message()))
+impl EncodedWriter {
+    fn create(path: &Path, format: Format, kbps: u32) -> Result<Self, String> {
+        let name = if format == Format::M4a { "M4A" } else { "MP3" };
+        unsafe { Self::create_inner(path, format, kbps, name) }.map_err(|e| format!("{name} encoder error: {}", e.message()))
     }
 
-    unsafe fn create_inner(path: &Path) -> windows::core::Result<Self> {
+    unsafe fn create_inner(path: &Path, format: Format, kbps: u32, name: &'static str) -> windows::core::Result<Self> {
+        let container = if format == Format::M4a { MFTranscodeContainerType_ADTS } else { MFTranscodeContainerType_MP3 };
+        Self::create_with(path, format, kbps, name, container)
+    }
+
+    unsafe fn create_with(path: &Path, format: Format, kbps: u32, name: &'static str, container: GUID) -> windows::core::Result<Self> {
         MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
 
         let mut attrs: Option<IMFAttributes> = None;
         MFCreateAttributes(&mut attrs, 1)?;
         let attrs = attrs.unwrap();
-        attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MP3)?;
+        attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &container)?;
 
         let url = HSTRING::from(path.as_os_str());
         let writer = MFCreateSinkWriterFromURL(&url, None, &attrs)?;
 
         let out = MFCreateMediaType()?;
         out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-        out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_MP3)?;
         out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, SAMPLE_RATE)?;
         out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, CHANNELS)?;
-        out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 320_000 / 8)?;
+        out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kbps * 1000 / 8)?;
+        if format == Format::M4a {
+            out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+            out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        } else {
+            out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_MP3)?;
+        }
         let stream = writer.AddStream(&out)?;
 
         let inp = MFCreateMediaType()?;
@@ -205,17 +244,18 @@ impl Mp3Writer {
         writer.SetInputMediaType(stream, &inp, None)?;
         writer.BeginWriting()?;
 
-        Ok(Mp3Writer {
+        Ok(EncodedWriter {
             writer,
             stream,
-            pending: Vec::with_capacity(MP3_CHUNK_FRAMES * 4),
+            pending: Vec::with_capacity(CHUNK_FRAMES * 4),
             frames_done: 0,
+            name,
         })
     }
 
     fn write(&mut self, samples: &[i16]) -> Result<(), String> {
         self.pending.extend_from_slice(samples);
-        if self.pending.len() >= MP3_CHUNK_FRAMES * CHANNELS as usize {
+        if self.pending.len() >= CHUNK_FRAMES * CHANNELS as usize {
             self.flush()?;
         }
         Ok(())
@@ -225,7 +265,8 @@ impl Mp3Writer {
         if self.pending.is_empty() {
             return Ok(());
         }
-        unsafe { self.flush_inner() }.map_err(|e| format!("MP3 encoder error: {}", e.message()))?;
+        let name = self.name;
+        unsafe { self.flush_inner() }.map_err(|e| format!("{name} encoder error: {}", e.message()))?;
         self.pending.clear();
         Ok(())
     }
@@ -252,12 +293,13 @@ impl Mp3Writer {
 
     fn finish(mut self) -> Result<(), String> {
         let r = self.flush();
+        let name = self.name;
         let fin = unsafe { self.writer.Finalize() };
         drop(self.writer);
         unsafe {
             let _ = MFShutdown();
         }
         r?;
-        fin.map_err(|e| format!("Could not finalize MP3: {}", e.message()))
+        fin.map_err(|e| format!("Could not finalize {name}: {}", e.message()))
     }
 }

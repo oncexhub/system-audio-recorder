@@ -1,6 +1,6 @@
 //! Simple trim editor: load a recording's waveform, preview it, and cut off
 //! the start and/or end. Cutting never re-encodes: WAV is copied byte-exact
-//! and MP3 is cut on frame boundaries (~24 ms), so quality never drops and
+//! and MP3/M4A are cut on frame boundaries (~21-24 ms), so quality never drops and
 //! even hours-long files save in seconds.
 
 use std::fs::File;
@@ -22,6 +22,7 @@ use windows::Win32::System::Variant::VT_I8;
 pub enum Kind {
     Wav,
     Mp3,
+    M4a,
 }
 
 impl Kind {
@@ -29,6 +30,7 @@ impl Kind {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "wav" => Some(Kind::Wav),
             "mp3" => Some(Kind::Mp3),
+            "m4a" => Some(Kind::M4a),
             _ => None,
         }
     }
@@ -66,7 +68,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn open(path: PathBuf) -> Result<Editor, String> {
-        let kind = Kind::of(&path).ok_or("Only WAV and MP3 files can be trimmed.")?;
+        let kind = Kind::of(&path).ok_or("Only WAV, MP3 and M4A files can be trimmed.")?;
         if !path.exists() {
             return Err("That file no longer exists.".into());
         }
@@ -219,6 +221,7 @@ impl Editor {
         match self.kind {
             Kind::Wav => trim_wav(&self.path, dest, self.start, self.end),
             Kind::Mp3 => trim_mp3(&self.path, dest, self.start, self.end),
+            Kind::M4a => crate::mp4::trim_m4a(&self.path, dest, self.start, self.end),
         }
     }
 }

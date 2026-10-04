@@ -10,6 +10,8 @@ pub struct Settings {
     pub hotkey: u16,
     pub folder: PathBuf,
     pub format: Format,
+    /// Bitrate for MP3 and M4A.
+    pub bitrate: u32,
     pub close_to_tray: bool,
     /// The first-run "Add SAR to your desktop?" question was answered.
     pub shortcut_asked: bool,
@@ -19,11 +21,16 @@ const HOTKEYF_CONTROL: u16 = 0x02;
 const HOTKEYF_ALT: u16 = 0x04;
 
 impl Settings {
+    pub fn kbps(&self) -> u32 {
+        self.bitrate
+    }
+
     pub fn load() -> Settings {
         let mut s = Settings {
             hotkey: ((HOTKEYF_CONTROL | HOTKEYF_ALT) << 8) | b'R' as u16,
             folder: default_folder(),
             format: Format::Wav,
+            bitrate: 192,
             close_to_tray: true,
             shortcut_asked: false,
         };
@@ -34,7 +41,14 @@ impl Settings {
                 match k.trim() {
                     "hotkey" => s.hotkey = v.parse().unwrap_or(s.hotkey),
                     "folder" if !v.is_empty() => s.folder = PathBuf::from(v),
-                    "format" => s.format = if v == "mp3" { Format::Mp3 } else { Format::Wav },
+                    "format" => {
+                        s.format = match v {
+                            "mp3" => Format::Mp3,
+                            "m4a" => Format::M4a,
+                            _ => Format::Wav,
+                        }
+                    }
+                    "bitrate" => s.bitrate = v.parse().ok().filter(|b| crate::ui::BITRATES.contains(b)).unwrap_or(s.bitrate),
                     "close_to_tray" => s.close_to_tray = v != "0",
                     "shortcut_asked" => s.shortcut_asked = v == "1",
                     _ => {}
@@ -50,10 +64,11 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "hotkey={}\nfolder={}\nformat={}\nclose_to_tray={}\nshortcut_asked={}\n",
+            "hotkey={}\nfolder={}\nformat={}\nbitrate={}\nclose_to_tray={}\nshortcut_asked={}\n",
             self.hotkey,
             self.folder.display(),
             self.format.ext(),
+            self.bitrate,
             self.close_to_tray as u8,
             self.shortcut_asked as u8
         );

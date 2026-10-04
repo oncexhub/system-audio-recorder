@@ -25,6 +25,7 @@ One hotkey to start, the same hotkey to stop. Tiny, native and free.
 - 🎧 **System audio only.** Records exactly what you hear (browser, Spotify, games, Discord), never the microphone.
 - ⌨️ **One global hotkey.** `Ctrl + Alt + R` starts and stops from anywhere, even in a game. You can change it.
 - ✂️ **Built-in trimming.** Cut off a late start or an early stop in seconds, with no quality loss.
+- 🎚️ **WAV, MP3 or M4A.** Choose 96–320 kbps for MP3 and M4A. The default is 192 kbps.
 - ⏱️ **Long recordings.** No length limit, and files stay playable even after a crash.
 - 🪶 **Tiny and light.** About 0.5 MB, no installer, about 1% CPU. Runs quietly in the tray.
 
@@ -68,7 +69,7 @@ The app records whatever device Windows is playing through: speakers, headphones
 
 Started a little too early or stopped too late? Cut it off:
 
-1. Click **Trim** after a recording, or click **TRIM** at the top and pick a file. You can also drag a `.wav` or `.mp3` onto the window.
+1. Click **Trim** after a recording, or click **TRIM** at the top and pick a file. You can also drag a `.wav`, `.mp3` or `.m4a` onto the window.
 2. Drag the two handles. Fine-tune with **− / +** or the arrow keys (0.1 s, or 1 s with Shift).
 3. Press **▶** to check the start or the end, and Space to play the selection.
 4. Click **Save as copy** to keep the original, or **Replace original** to overwrite it (the app asks first).
@@ -77,10 +78,13 @@ Cutting never re-encodes, so quality stays identical and even hours-long recordi
 
 ## Formats
 
-| Format | Quality | Size |
+| Format | Quality | Size per hour |
 |---|---|---|
-| **WAV** (default) | Lossless, 48 kHz / 16-bit stereo | about 690 MB per hour |
-| **MP3** | 320 kbps | about 140 MB per hour |
+| **WAV** (default) | Lossless, 48 kHz / 16-bit stereo | ~690 MB |
+| **MP3** | 96 / 128 / **192** / 256 / 320 kbps | ~43–144 MB |
+| **M4A** (AAC) | 96 / 128 / **192** / 256 / 320 kbps | ~43–144 MB |
+
+At the same bitrate, M4A usually sounds a bit better than MP3. 192 kbps (~86 MB per hour) is a good balance for both.
 
 ## Settings and uninstalling
 
@@ -95,7 +99,7 @@ Settings are stored in `%APPDATA%\SystemAudioRecorder\settings.ini`. To remove t
 - WASAPI **loopback** on the default playback device captures exactly what you hear.
 - A silent playback stream keeps the audio engine running, so silences stay in the recording and its length is exact.
 - Audio is streamed straight to disk. WAV headers are refreshed every few seconds, and files over 4 GB become RF64.
-- MP3 encoding uses the encoder built into Windows (Media Foundation).
+- MP3 and AAC encoding use the encoders built into Windows (Media Foundation). M4A is recorded as an AAC stream (playable even after a crash) and wrapped into an .m4a when you stop, without re-encoding.
 - The UI is drawn with Direct2D, which is also built into Windows. There is no web engine and no framework.
 
 </details>
